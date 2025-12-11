@@ -4,7 +4,7 @@
  * Description: Securely connects your WordPress site to the Telegram Management Bot.
  * Version: 2.0.0
  * Author: Shahin Ilderemi
- * License: GPLv2 or later
+ * License: MIT
  */
 
 if (!defined('ABSPATH')) exit;
