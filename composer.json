@@ -1,0 +1,21 @@
+{
+    "name": "ildrm/telegram-wordpress-bot",
+    "description": "Manage unlimited WordPress sites from a single Telegram chat.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": "^7.4 || ^8.0",
+        "ext-curl": "*",
+        "ext-pdo": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.6",
+        "phpstan/phpstan": "^1.11"
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyze": "phpstan analyse",
+        "lint": "php -l telegram_wordpress_bot.php && php -l wp-telegram-connector.php"
+    }
+}
