@@ -1,0 +1,29 @@
+<?php
+/**
+ * Local configuration for the Telegram WordPress Master Bot.
+ *
+ * Copy this file to `config.local.php` and fill in real values.
+ * `config.local.php` is gitignored and MUST never be committed.
+ *
+ * Every value can also be supplied via environment variables
+ * (TGWP_BOT_TOKEN, TGWP_ADMIN_IDS, TGWP_WEBHOOK_SECRET, TGWP_DEBUG);
+ * values returned here take precedence over the env fallback.
+ */
+
+return [
+    // From @BotFather. Required.
+    'bot_token' => 'YOUR_BOT_TOKEN_HERE',
+
+    // Comma-separated list (or array) of Telegram user IDs allowed to use the
+    // bot. REQUIRED — the bot refuses to operate with an empty allowlist.
+    // Example: [123456789, 987654321]
+    'admin_ids' => [],
+
+    // Shared secret echoed by Telegram in the X-Telegram-Bot-Api-Secret-Token
+    // header. Set the SAME value when calling setWebhook?secret_token=...
+    // Required. Generate with: bin2hex(random_bytes(16))
+    'webhook_secret' => '',
+
+    // Verbose logging to bot.log.
+    'debug' => false,
+];

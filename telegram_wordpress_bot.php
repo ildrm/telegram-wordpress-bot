@@ -1,15 +1,67 @@
 <?php
 /**
- * Telegram WordPress Master Bot v2.0
- * COMPLETE UPGRADE: Multisite + Plugins + Themes
+ * Telegram WordPress Master Bot v2.1
+ * Multisite + Plugins + Themes, with security hardening and completed handlers.
  */
 
 // --- CONFIGURATION ---
-const BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE';
-const ADMIN_ID = 0;
-const DB_FILE = __DIR__ . '/bot.db';
-const LOG_FILE = __DIR__ . '/bot.log';
-const DEBUG = false;
+// Secrets are loaded from config.local.php (gitignored) with an environment
+// variable fallback. Nothing sensitive is hardcoded in this file.
+$__cfg = file_exists(__DIR__ . '/config.local.php') ? require __DIR__ . '/config.local.php' : [];
+
+$__admin_ids = $__cfg['admin_ids'] ?? getenv('TGWP_ADMIN_IDS') ?: [];
+if (is_string($__admin_ids)) {
+    $__admin_ids = array_filter(array_map('trim', explode(',', $__admin_ids)), 'strlen');
+}
+$__admin_ids = array_values(array_map('intval', (array) $__admin_ids));
+
+define('BOT_TOKEN', $__cfg['bot_token'] ?? getenv('TGWP_BOT_TOKEN') ?: '');
+define('ADMIN_IDS', $__admin_ids);
+define('WEBHOOK_SECRET', $__cfg['webhook_secret'] ?? getenv('TGWP_WEBHOOK_SECRET') ?: '');
+define('DB_FILE', __DIR__ . '/bot.db');
+define('LOG_FILE', __DIR__ . '/bot.log');
+define('DEBUG', (bool) ($__cfg['debug'] ?? getenv('TGWP_DEBUG') ?: false));
+
+function tgwp_log($msg) {
+    if (!DEBUG) return;
+    $line = '[' . date('c') . '] ' . (is_string($msg) ? $msg : json_encode($msg)) . "\n";
+    @file_put_contents(LOG_FILE, $line, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Validate a user-supplied site URL before the bot makes a server-side request
+ * to it. Blocks SSRF against internal/loopback/link-local hosts and requires
+ * HTTPS. Returns the normalized URL or null if rejected.
+ */
+function tgwp_validate_site_url($url) {
+    $url = trim((string) $url);
+    if (!filter_var($url, FILTER_VALIDATE_URL)) return null;
+
+    $parts = parse_url($url);
+    if (empty($parts['scheme']) || strtolower($parts['scheme']) !== 'https') return null;
+    if (empty($parts['host'])) return null;
+
+    $host = $parts['host'];
+
+    // Resolve to IPs and reject anything that is not a public address.
+    $ips = [];
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ips[] = $host;
+    } else {
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        foreach ((array) $records as $r) {
+            if (!empty($r['ip'])) $ips[] = $r['ip'];
+            if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
+        }
+        if (!$ips) return null; // unresolvable host
+    }
+    foreach ($ips as $ip) {
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return null; // private, loopback, reserved or link-local
+        }
+    }
+    return $url;
+}
 
 // --- FRAMEWORK ---
 class DB {
@@ -28,9 +80,14 @@ class DB {
         self::query("CREATE TABLE IF NOT EXISTS sites (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, url TEXT, token TEXT, multisite INTEGER, extra TEXT, FOREIGN KEY(user_id) REFERENCES users(id))");
     }
     public static function query($sql, $params = []) {
-        $stmt = self::connect()->prepare($sql);
-        $stmt->execute($params);
-        return $stmt;
+        try {
+            $stmt = self::connect()->prepare($sql);
+            $stmt->execute($params);
+            return $stmt;
+        } catch (PDOException $e) {
+            tgwp_log('DB error: ' . $e->getMessage() . ' | SQL: ' . $sql);
+            throw $e;
+        }
     }
     public static function fetch($sql, $params = []) {
         return self::query($sql, $params)->fetch(PDO::FETCH_ASSOC);
@@ -46,9 +103,19 @@ class TG {
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
         curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         $res = curl_exec($ch);
+        if ($res === false) {
+            tgwp_log("Telegram $method failed: " . curl_error($ch));
+            curl_close($ch);
+            return null;
+        }
         curl_close($ch);
-        return json_decode($res, true);
+        $decoded = json_decode($res, true);
+        if (isset($decoded['ok']) && !$decoded['ok']) {
+            tgwp_log("Telegram $method API error: " . ($decoded['description'] ?? 'unknown'));
+        }
+        return $decoded;
     }
     public static function send($chat_id, $text, $keyboard = null) {
         return self::request('sendMessage', ['chat_id' => $chat_id, 'text' => $text, 'parse_mode' => 'HTML', 'reply_markup' => $keyboard ? json_encode($keyboard) : null]);
@@ -68,11 +135,17 @@ class WP {
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, ['Authorization: Bearer ' . $site['token']]);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
             curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
         }
         $res = curl_exec($ch);
+        if ($res === false) {
+            tgwp_log("WP call $endpoint failed: " . curl_error($ch));
+            curl_close($ch);
+            return null;
+        }
         curl_close($ch);
         return json_decode($res, true);
     }
@@ -80,18 +153,70 @@ class WP {
 
 // --- LOGIC ---
 
+// Allow the file to be required by unit tests (which exercise the classes and
+// helper functions above) without running the webhook handler.
+if (php_sapi_name() === 'cli' && getenv('TGWP_TEST')) {
+    return;
+}
+
+// Fail closed: the bot cannot operate without a token, an admin allowlist,
+// and a webhook secret. This prevents an unconfigured deployment from being
+// wide open to any Telegram user.
+if (BOT_TOKEN === '' || empty(ADMIN_IDS) || WEBHOOK_SECRET === '') {
+    http_response_code(500);
+    tgwp_log('Refusing to run: bot_token, admin_ids and webhook_secret must all be configured.');
+    exit;
+}
+
+// Health-check cron: ping every connected site's /stats endpoint and alert the
+// owning Telegram user if a site is unreachable. Protected by the same secret
+// as the webhook: call as bot.php?cron=<WEBHOOK_SECRET>
+if (isset($_GET['cron'])) {
+    if (!hash_equals(WEBHOOK_SECRET, (string) $_GET['cron'])) {
+        http_response_code(403);
+        exit;
+    }
+    $sites = DB::fetchAll(
+        "SELECT s.*, u.tg_id AS owner_tg FROM sites s JOIN users u ON u.id = s.user_id"
+    );
+    $checked = 0; $down = 0;
+    foreach ($sites as $s) {
+        $res = WP::call($s, '/stats');
+        $checked++;
+        if (!is_array($res) || !isset($res['posts'])) {
+            $down++;
+            TG::send($s['owner_tg'], "🔴 Site unreachable: {$s['name']} ({$s['url']})");
+            tgwp_log("Cron: site down id={$s['id']} url={$s['url']}");
+        }
+    }
+    echo "Cron OK: checked $checked, down $down";
+    exit;
+}
+
+// Verify the request actually came from Telegram. Telegram echoes the secret
+// configured via setWebhook in this header on every webhook delivery.
+$incoming_secret = $_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '';
+if (!hash_equals(WEBHOOK_SECRET, $incoming_secret)) {
+    http_response_code(403);
+    tgwp_log('Rejected webhook: bad or missing secret token.');
+    exit;
+}
+
 $update = json_decode(file_get_contents('php://input'), true);
-if (isset($_GET['cron'])) { echo "Cron OK"; exit; }
 if (!$update) exit;
 
 $chat_id = $update['message']['chat']['id'] ?? $update['callback_query']['message']['chat']['id'] ?? null;
 $tg_id = $update['message']['from']['id'] ?? $update['callback_query']['from']['id'] ?? null;
 $text = $update['message']['text'] ?? null;
 $callback = $update['callback_query']['data'] ?? null;
+$cb_id = $update['callback_query']['id'] ?? null;
 $msg_id = $update['message']['message_id'] ?? $update['callback_query']['message']['message_id'] ?? null;
 
-// Auth
-if (ADMIN_ID > 0 && $tg_id != ADMIN_ID) exit;
+// Authorization: only allow-listed Telegram user IDs.
+if (!in_array((int) $tg_id, ADMIN_IDS, true)) {
+    tgwp_log('Rejected unauthorized tg_id: ' . $tg_id);
+    exit;
+}
 
 // User Session
 $user = DB::fetch("SELECT * FROM users WHERE tg_id = ?", [$tg_id]);
@@ -118,14 +243,25 @@ if ($text) {
        // ... Connect logic (simplified for brevity, assume v1 logic exists) ...
        // Re-implemeting vital connect logic for completeness
        if ($user['state'] === 'await_url') {
-           $data = json_decode($user['data'], true); $data['conn_url'] = $text;
+           $clean_url = tgwp_validate_site_url($text);
+           if (!$clean_url) {
+               TG::send($chat_id, "❌ Invalid URL. Use a public HTTPS address (e.g. https://example.com).");
+               exit;
+           }
+           $data = json_decode($user['data'], true); $data['conn_url'] = $clean_url;
            DB::query("UPDATE users SET data = ?, state = 'await_token' WHERE tg_id = ?", [json_encode($data), $tg_id]);
            TG::send($chat_id, "URL Saved. Now paste Token:");
            exit;
        }
        if ($user['state'] === 'await_token') {
            // Verify
-           $data = json_decode($user['data'], true); $url = $data['conn_url'];
+           $data = json_decode($user['data'], true);
+           $url = tgwp_validate_site_url($data['conn_url'] ?? '');
+           if (!$url) {
+               TG::send($chat_id, "❌ Stored URL is invalid. Please start over with Connect.");
+               DB::query("UPDATE users SET state='idle' WHERE tg_id=?", [$tg_id]);
+               exit;
+           }
            $res = WP::call(['url'=>$url,'token'=>$text], '/connect'); // Temp obj
            if(isset($res['name'])) {
                DB::query("INSERT INTO sites (user_id,name,url,token,multisite) VALUES (?,?,?,?,?)", [$user['id'], $res['name'], $url, $text, $res['multisite']?1:0]);
@@ -150,6 +286,38 @@ if ($text) {
         $kb[] = [['text' => '🔙 Back', 'callback_data' => 'feat_installers']];
         TG::send($chat_id, "Search Results for '$text':", ['inline_keyboard' => $kb]);
         DB::query("UPDATE users SET state='idle' WHERE tg_id=?", [$tg_id]);
+        exit;
+    }
+
+    // New-post compose flow
+    if ($user['state'] === 'post_title') {
+        $user_data['draft']['title'] = $text;
+        DB::query("UPDATE users SET state='post_body', data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+        TG::send($chat_id, "Now send the post <b>body</b> (HTML allowed):");
+        exit;
+    }
+    if ($user['state'] === 'post_body') {
+        $user_data['draft']['content'] = $text;
+        DB::query("UPDATE users SET state='idle', data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+        TG::send($chat_id, "How should I save it?", ['inline_keyboard' => [
+            [['text' => '🟢 Publish now', 'callback_data' => 'pub_publish']],
+            [['text' => '🕒 Schedule', 'callback_data' => 'pub_future']],
+            [['text' => '📝 Save draft', 'callback_data' => 'pub_draft']],
+        ]]);
+        exit;
+    }
+    if ($user['state'] === 'post_schedule') {
+        if (!$current_site) { TG::send($chat_id, "⚠️ No site selected."); exit; }
+        $draft = $user_data['draft'] ?? [];
+        $res = WP::call($current_site, '/posts', [
+            'action' => 'create', 'status' => 'future',
+            'title' => $draft['title'] ?? '', 'content' => $draft['content'] ?? '',
+            'date' => $text,
+        ], 'POST');
+        $ok = isset($res['success']) && $res['success'];
+        unset($user_data['draft']);
+        DB::query("UPDATE users SET state='idle', data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+        TG::send($chat_id, $ok ? "✅ Scheduled. " . ($res['link'] ?? '') : "❌ " . ($res['message'] ?? 'Could not schedule (check date format/future).'));
         exit;
     }
 }
@@ -181,7 +349,7 @@ if (isset($update['message']['document']) && $current_site) {
 
 // Route: Callbacks
 if ($callback) {
-    TG::answer($callback['id']);
+    TG::answer($cb_id);
     
     // Global Navigation
     if ($callback === 'home') {
@@ -199,10 +367,15 @@ if ($callback) {
 
     // Site Dashboard
     if (strpos($callback, 'site_') === 0) {
-        $sid = str_replace('site_', '', $callback);
+        $sid = (int) substr($callback, strlen('site_'));
+        // Ownership check: only switch to a site that belongs to this user.
+        $s = DB::fetch("SELECT * FROM sites WHERE id=? AND user_id=?", [$sid, $user['id']]);
+        if (!$s) {
+            TG::send($chat_id, "❌ Site not found.");
+            exit;
+        }
         DB::query("UPDATE users SET current_site=?,data='{}' WHERE tg_id=?", [$sid, $tg_id]);
-        $s = DB::fetch("SELECT * FROM sites WHERE id=?", [$sid]);
-        
+
         $is_net_root = ($s['multisite']); // If this IS the network root
         
         $kb = [];
@@ -219,8 +392,19 @@ if ($callback) {
         $kb[] = [['text' => '🔙 Home', 'callback_data' => 'home']];
         
         TG::edit($chat_id, $msg_id, "Dashboard: {$s['name']}", ['inline_keyboard' => $kb]);
+        exit;
     }
-    
+
+    // Every callback below operates on the currently-selected site.
+    $site_prefixes = ['net_sites', 'visit_', 'feat_', 'pact_', 'pactok_', 'find_', 'inst_', 'ask_upload', 'set_up_', 'child_',
+        'post_new', 'pub_', 'cmt_', 'cmod_', 'thsw_', 'sys_'];
+    $needs_site = false;
+    foreach ($site_prefixes as $p) { if (strpos($callback, $p) === 0) { $needs_site = true; break; } }
+    if ($needs_site && !$current_site) {
+        TG::send($chat_id, "⚠️ Please select a site first (/start → My Sites).");
+        exit;
+    }
+
     // Network Sites List
     if ($callback === 'net_sites') {
         $res = WP::call($current_site, '/sites');
@@ -256,41 +440,213 @@ if ($callback) {
     if (strpos($callback, 'feat_plugins') === 0) {
         $net = (strpos($callback, '_net') !== false) ? 1 : 0;
         $res = WP::call($current_site, '/plugins' . ($net ? '?network=1' : ''));
-        
+
+        // Telegram limits callback_data to 64 bytes, so we cannot inline the
+        // plugin path. Store an index->path map in the user's session and
+        // reference plugins by short integer index instead.
         $kb = [];
-        // Pagination logic omitted for single-file brevity, listing first 10-15
-        if(!empty($res)) {
+        $plugmap = [];
+        if (!empty($res) && is_array($res)) {
             $count = 0;
-            foreach($res as $p) {
-                if($count++ > 15) break; 
+            foreach ($res as $p) {
+                if ($count > 15) break;
+                $idx = $count++;
+                $plugmap[$idx] = $p['path'];
                 $status = $p['active'] ? '✅' : '⚫️';
-                $act = 'plugidx_' .  ($net?'n':'s') . '_' . md5($p['path']); // Use hash to keep callback short, storing map optional OR just listing commonly?
-                // Problem: md5 mapping requires state. Using index? Or truncated slug.
-                // Better: Just show status. Actions need detail view.
-                // Let's make the button toggle:
                 $action = $p['active'] ? 'deactivate' : 'activate';
-                // Shorten path
                 $short = substr(basename($p['path']), 0, 20);
-                $kb[] = [['text' => "$status $short", 'callback_data' => "pact_{$action}_" . ($net?1:0) . "_" . base64_encode($p['path'])]]; 
+                $kb[] = [['text' => "$status $short", 'callback_data' => "pact_{$action}_{$net}_{$idx}"]];
+            }
+        }
+        // Persist the map (preserving any existing session data such as sub_id).
+        $user_data['plugmap'] = $plugmap;
+        DB::query("UPDATE users SET data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+
+        $kb[] = [['text' => '🔙 Back', 'callback_data' => 'site_' . $current_site['id']]];
+        TG::edit($chat_id, $msg_id, "Plugins:", ['inline_keyboard' => $kb]);
+        exit;
+    }
+
+    // Plugin Action — pact_ACTION_NET_IDX (idx resolves via session plugmap).
+    // Destructive actions are confirmed first via a pactok_ callback.
+    if (strpos($callback, 'pact_') === 0 || strpos($callback, 'pactok_') === 0) {
+        $confirmed = strpos($callback, 'pactok_') === 0;
+        $parts = explode('_', $callback);
+        if (count($parts) !== 4 || !in_array($parts[1], ['activate', 'deactivate', 'delete'], true)) {
+            TG::answer($cb_id, "Invalid action.");
+            exit;
+        }
+        $act = $parts[1];
+        $net = (int) $parts[2];
+        $idx = (int) $parts[3];
+        $path = $user_data['plugmap'][$idx] ?? null;
+        if ($path === null) {
+            TG::answer($cb_id, "Stale list — please reopen Plugins.");
+            exit;
+        }
+
+        // Confirmation gate for the irreversible delete action.
+        if ($act === 'delete' && !$confirmed) {
+            TG::edit($chat_id, $msg_id, "⚠️ Delete plugin " . basename($path) . "? This cannot be undone.", ['inline_keyboard' => [
+                [['text' => '🗑 Yes, delete', 'callback_data' => "pactok_delete_{$net}_{$idx}"]],
+                [['text' => '🔙 Cancel', 'callback_data' => 'feat_plugins' . ($net ? '_net' : '')]],
+            ]]);
+            exit;
+        }
+
+        $res = WP::call($current_site, '/plugins', ['action' => $act, 'plugin' => $path, 'network' => $net], 'POST');
+        $ok = isset($res['success']) && $res['success'];
+        TG::answer($cb_id, $ok ? "Done: $act" : "Failed: $act");
+        TG::send($chat_id, ($ok ? "✅" : "❌") . " $act: " . basename($path) . "\nReopen Plugins to refresh.");
+        exit;
+    }
+    
+    // Posts: list recent + compose new
+    if ($callback === 'feat_posts') {
+        $res = WP::call($current_site, '/posts');
+        $kb = [];
+        if (!empty($res) && is_array($res) && !isset($res['code'])) {
+            foreach ($res as $p) {
+                $icon = $p['status'] === 'publish' ? '🟢' : ($p['status'] === 'future' ? '🕒' : '📝');
+                $kb[] = [['text' => "$icon " . mb_substr($p['title'] ?: '(untitled)', 0, 30), 'callback_data' => 'noop']];
+            }
+        }
+        $kb[] = [['text' => '✍️ New Post', 'callback_data' => 'post_new']];
+        $kb[] = [['text' => '🔙 Back', 'callback_data' => 'site_' . $current_site['id']]];
+        TG::edit($chat_id, $msg_id, "Recent Posts:", ['inline_keyboard' => $kb]);
+        exit;
+    }
+
+    // Start the new-post compose flow (title, then body, then publish choice)
+    if ($callback === 'post_new') {
+        $user_data['draft'] = [];
+        DB::query("UPDATE users SET state='post_title', data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+        TG::send($chat_id, "✍️ Send the post <b>title</b>:");
+        exit;
+    }
+
+    // Publish-mode choice for a composed draft
+    if (in_array($callback, ['pub_publish', 'pub_draft', 'pub_future'], true)) {
+        $draft = $user_data['draft'] ?? null;
+        if (!$draft || !isset($draft['title'])) {
+            TG::answer($cb_id, "No draft in progress.");
+            exit;
+        }
+        if ($callback === 'pub_future') {
+            DB::query("UPDATE users SET state='post_schedule' WHERE tg_id=?", [$tg_id]);
+            TG::send($chat_id, "🕒 Send publish time (YYYY-MM-DD HH:MM, site timezone):");
+            exit;
+        }
+        $status = $callback === 'pub_publish' ? 'publish' : 'draft';
+        $res = WP::call($current_site, '/posts', [
+            'action' => 'create', 'status' => $status,
+            'title' => $draft['title'], 'content' => $draft['content'] ?? '',
+        ], 'POST');
+        $ok = isset($res['success']) && $res['success'];
+        unset($user_data['draft']);
+        DB::query("UPDATE users SET state='idle', data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+        TG::send($chat_id, $ok ? "✅ Post saved ($status). " . ($res['link'] ?? '') : "❌ Failed to save post.");
+        exit;
+    }
+
+    // Comments moderation queue
+    if ($callback === 'feat_comments') {
+        $res = WP::call($current_site, '/comments?status=hold');
+        $kb = [];
+        $cmtmap = [];
+        if (!empty($res) && is_array($res) && !isset($res['code'])) {
+            $i = 0;
+            foreach ($res as $c) {
+                $cmtmap[$i] = $c['id'];
+                $kb[] = [['text' => "💬 {$c['author']}: " . mb_substr($c['content'], 0, 25), 'callback_data' => "cmt_$i"]];
+                $i++;
+            }
+        }
+        $user_data['cmtmap'] = $cmtmap;
+        DB::query("UPDATE users SET data=? WHERE tg_id=?", [json_encode($user_data), $tg_id]);
+        $kb[] = [['text' => '🔙 Back', 'callback_data' => 'site_' . $current_site['id']]];
+        TG::edit($chat_id, $msg_id, empty($cmtmap) ? "No pending comments 🎉" : "Pending Comments:", ['inline_keyboard' => $kb]);
+        exit;
+    }
+
+    // Single comment moderation actions
+    if (strpos($callback, 'cmt_') === 0) {
+        $idx = (int) substr($callback, 4);
+        $cid = $user_data['cmtmap'][$idx] ?? null;
+        if ($cid === null) { TG::answer($cb_id, "Stale — reopen Comments."); exit; }
+        TG::edit($chat_id, $msg_id, "Comment #$cid — choose action:", ['inline_keyboard' => [
+            [['text' => '✅ Approve', 'callback_data' => "cmod_approve_$idx"], ['text' => '🚫 Spam', 'callback_data' => "cmod_spam_$idx"]],
+            [['text' => '🗑 Trash', 'callback_data' => "cmod_trash_$idx"]],
+            [['text' => '🔙 Back', 'callback_data' => 'feat_comments']],
+        ]]);
+        exit;
+    }
+    if (strpos($callback, 'cmod_') === 0) {
+        list($_d, $act, $idx) = explode('_', $callback) + [null, null, null];
+        $cid = $user_data['cmtmap'][(int) $idx] ?? null;
+        if ($cid === null || !in_array($act, ['approve', 'spam', 'trash'], true)) { TG::answer($cb_id, "Invalid."); exit; }
+        $res = WP::call($current_site, '/comments', ['id' => $cid, 'action' => $act], 'POST');
+        TG::answer($cb_id, isset($res['success']) && $res['success'] ? "Done: $act" : "Failed");
+        TG::send($chat_id, "Comment #$cid: $act. Reopen Comments to refresh.");
+        exit;
+    }
+
+    // Themes list + switch
+    if (strpos($callback, 'feat_themes') === 0) {
+        $res = WP::call($current_site, '/themes');
+        $kb = [];
+        if (!empty($res) && is_array($res) && !isset($res['code'])) {
+            foreach ($res as $t) {
+                $icon = !empty($t['active']) ? '✅' : '🎨';
+                $cb = !empty($t['active']) ? 'noop' : 'thsw_' . rawurlencode($t['slug']);
+                $kb[] = [['text' => "$icon {$t['name']}", 'callback_data' => $cb]];
             }
         }
         $kb[] = [['text' => '🔙 Back', 'callback_data' => 'site_' . $current_site['id']]];
-        TG::edit($chat_id, $msg_id, "Plugins:", ['inline_keyboard' => $kb]);
+        TG::edit($chat_id, $msg_id, "Themes:", ['inline_keyboard' => $kb]);
+        exit;
     }
-    
-    // Plugin Action
-    if (strpos($callback, 'pact_') === 0) {
-        // pact_ACTION_NET_B64PATH
-        list($dummy, $act, $net, $b64) = explode('_', $callback);
-        $path = base64_decode($b64);
-        WP::call($current_site, '/plugins', ['action' => $act, 'plugin' => $path, 'network' => $net], 'POST');
-        TG::answer($callback['id'], "Done: $act");
-        // Refresh
-        // Recursively call handler? Need to reconstruct callback data
-        // For now, simple refresh msg
-        TG::send($chat_id, "Action completed. Refresh list manually.");
+    if (strpos($callback, 'thsw_') === 0) {
+        $slug = rawurldecode(substr($callback, 5));
+        $res = WP::call($current_site, '/themes', ['action' => 'switch', 'slug' => $slug], 'POST');
+        $ok = isset($res['success']) && $res['success'];
+        TG::answer($cb_id, $ok ? "Theme switched" : "Failed");
+        TG::send($chat_id, ($ok ? "✅ Activated: " : "❌ Failed: ") . $slug);
+        exit;
     }
-    
+
+    // System maintenance menu
+    if ($callback === 'feat_system') {
+        TG::edit($chat_id, $msg_id, "⚙️ System Maintenance:", ['inline_keyboard' => [
+            [['text' => '🧹 Flush Cache', 'callback_data' => 'sys_flush_cache'], ['text' => '🗜 Optimize DB', 'callback_data' => 'sys_optimize_db']],
+            [['text' => '⬆️ Update All', 'callback_data' => 'sys_update_all'], ['text' => '🔑 Magic Login', 'callback_data' => 'sys_magic']],
+            [['text' => '🔙 Back', 'callback_data' => 'site_' . $current_site['id']]],
+        ]]);
+        exit;
+    }
+    if ($callback === 'sys_flush_cache' || $callback === 'sys_optimize_db') {
+        $act = $callback === 'sys_flush_cache' ? 'flush_cache' : 'optimize_db';
+        $res = WP::call($current_site, '/system', ['action' => $act], 'POST');
+        TG::send($chat_id, isset($res['success']) && $res['success'] ? "✅ " . ($res['message'] ?? 'Done') : "❌ Failed");
+        exit;
+    }
+    if ($callback === 'sys_update_all') {
+        TG::send($chat_id, "⏳ Updating all plugins & themes...");
+        $res = WP::call($current_site, '/updates', ['type' => 'all'], 'POST');
+        $ok = isset($res['success']) && $res['success'];
+        TG::send($chat_id, ($ok ? "✅ " : "❌ ") . implode("\n", $res['log'] ?? ['Update failed']));
+        exit;
+    }
+    if ($callback === 'sys_magic') {
+        $res = WP::call($current_site, '/system', ['action' => 'magic_login'], 'POST');
+        if (isset($res['url'])) {
+            TG::send($chat_id, "🔑 One-time login (valid 5 min):\n" . $res['url']);
+        } else {
+            TG::send($chat_id, "❌ Could not create login link.");
+        }
+        exit;
+    }
+
     // Installers Menu
     if ($callback === 'feat_installers') {
         TG::edit($chat_id, $msg_id, "Select Type to Install:", ['inline_keyboard' => [

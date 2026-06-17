@@ -1,0 +1,15 @@
+# Local secrets / runtime — never commit
+config.local.php
+bot.db
+bot.db-journal
+bot.log
+
+# Dependencies / tooling
+/vendor/
+.phpunit.result.cache
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['7.4', '8.2']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, pdo_sqlite, json
+          coverage: none
+
+      - name: Lint PHP files
+        run: |
+          php -l telegram_wordpress_bot.php
+          php -l wp-telegram-connector.php
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Static analysis
+        run: vendor/bin/phpstan analyse --no-progress
+
+      - name: Unit tests
+        run: vendor/bin/phpunit
